@@ -190,6 +190,38 @@ async function probeRegistry() {
   return out;
 }
 
+async function publishOutputs(summary) {
+  const file = process.env.GITHUB_OUTPUT;
+  if (!file) return;
+  const login = summary.results.find((r) => r.label === 'headless-spoofed-ua')?.pages?.find((p) => p.name === 'login');
+  const lines = [
+    `verdict=${summary.productionVerdict}`,
+    `verdict_default_ua=${summary.verdicts['headless-default-ua'] ?? 'ERROR'}`,
+    `registry_status=${summary.registry.status ?? 'error'}`,
+    `login_http=${login?.httpStatus ?? 'none'}`,
+    `login_form=${login?.loginFormPresent ?? false}`,
+  ];
+  await fsPromises.appendFile(file, `${lines.join('\n')}\n`);
+}
+
+async function publishJobSummary(summary) {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (!file) return;
+  const rows = summary.results.flatMap((r) =>
+    (r.pages ?? []).map((p) => `| ${r.label} | ${p.name} | ${p.httpStatus ?? '-'} | ${p.blocked ? 'blocked' : 'ok'} | ${p.loginFormPresent ?? '-'} |`));
+  const md = [
+    `## Cloudflare spike: ${summary.productionVerdict}`,
+    '',
+    `Runner egress reached the registry API with status \`${summary.registry.status ?? 'error'}\` (latest \`${summary.registry.latest ?? '?'}\`).`,
+    '',
+    '| config | page | http | state | login form |',
+    '| --- | --- | --- | --- | --- |',
+    ...rows,
+    '',
+  ].join('\n');
+  await fsPromises.appendFile(file, md);
+}
+
 async function main() {
   await fsPromises.mkdir(OUT_DIR, { recursive: true });
   const meta = {
@@ -229,6 +261,12 @@ async function main() {
     results,
   };
   await fsPromises.writeFile(path.join(OUT_DIR, 'spike-result.json'), `${JSON.stringify(summary, null, 2)}\n`);
+
+  // Artifact and log downloads need a token, but step conclusions are readable
+  // without one. Publish the verdict as a step output so the workflow can turn
+  // it into pass/skip on named steps, making the result visible unauthenticated.
+  await publishOutputs(summary);
+  await publishJobSummary(summary);
 
   console.log('\n=== VERDICT ===');
   for (const [label, verdict] of Object.entries(summary.verdicts)) console.log(`${label}: ${verdict}`);
