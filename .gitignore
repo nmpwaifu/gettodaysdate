@@ -2,3 +2,5 @@ npm-debug.log*
 *.tgz
 .webauthn-state.json
 spike-out/
+*.pem
+credential-manifest.json
