@@ -1,0 +1,9 @@
+{
+  "name": "gettodaysdate-release-tooling",
+  "private": true,
+  "type": "module",
+  "description": "Release automation for gettodaysdate. Not published; excluded from the npm tarball by the package files allowlist.",
+  "dependencies": {
+    "puppeteer-core": "25.9.0"
+  }
+}

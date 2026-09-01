@@ -1,0 +1,67 @@
+name: Cloudflare spike (Phase 0)
+
+# Determines whether a GitHub-hosted runner can reach npmjs.com's login page
+# with a cold headless Chromium profile. Datacenter IPs are scored more
+# aggressively by Cloudflare than residential ones, so this must be measured
+# rather than assumed before building the publish workflow.
+#
+# Uses no secrets and performs no login: it loads public pages only. It runs on
+# push to spike branches so it can be triggered without the gh CLI.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'spike/**'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Runners ship Chrome, but pin an explicit install so the binary path and
+      # version are deterministic rather than dependent on image contents.
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Report environment
+        run: |
+          echo "chrome binary: ${{ steps.chrome.outputs.chrome-path }}"
+          "${{ steps.chrome.outputs.chrome-path }}" --version
+          echo "public egress IP: $(curl -s --max-time 10 https://api.ipify.org || echo unknown)"
+          echo "script/mkfifo present:"
+          command -v script mkfifo
+
+      - name: Install tooling dependencies
+        working-directory: .release
+        run: npm ci
+
+      - name: Run Cloudflare probe
+        working-directory: .release
+        env:
+          CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          SPIKE_OUT_DIR: ${{ github.workspace }}/spike-out
+        run: node spike-cloudflare.mjs
+
+      # Screenshots and JSON make a BLOCKED verdict diagnosable. No secrets are
+      # used by this job, so there is nothing sensitive to redact.
+      - name: Upload spike artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-out
+          path: spike-out/
+          if-no-files-found: warn
