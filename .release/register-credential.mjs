@@ -11,8 +11,13 @@
 //
 // Usage:
 //   node register-credential.mjs --key-dir=/path/to/keys [--label="My key"]
+//                               [--credential-id=<base64url>] [--credential-id-bytes=32]
 //                               [--endpoint=http://127.0.0.1:9222]
 //                               [--rp=www.npmjs.com] [--page-match=manageTfa]
+//
+// --credential-id chooses the id instead of using 32 random bytes. The text is
+// padded with '_' and canonicalized to exactly --credential-id-bytes bytes; see
+// normalizeChosenId.
 //
 // Requires: a Chromium already running with --remote-debugging-port, with the
 // registration page open. This script never launches or closes the browser.
@@ -29,6 +34,8 @@ const value = (name, fallback) => {
 
 const KEY_DIR = value('key-dir', process.env.WEBAUTHN_KEY_DIR);
 const LABEL = value('label', process.env.WEBAUTHN_KEY_LABEL ?? 'Local P-256 key');
+const CREDENTIAL_ID_ARG = value('credential-id', process.env.WEBAUTHN_CREDENTIAL_ID);
+const TARGET_ID_BYTES = Number(value('credential-id-bytes', '32'));
 const ENDPOINT = value('endpoint', process.env.BROWSER_ENDPOINT ?? 'http://127.0.0.1:9222');
 const RP_ID = value('rp', 'www.npmjs.com');
 const PAGE_MATCH = value('page-match', 'manageTfa');
@@ -37,6 +44,43 @@ const STEP_TIMEOUT_MS = 15000;
 if (!KEY_DIR) {
   console.error('error: --key-dir is required (directory containing private.pem and public.pem)');
   process.exit(2);
+}
+
+// A credential id is BYTES; base64url is only the wire form. A hand-written id
+// must therefore survive a decode/encode round trip, or the value registered and
+// the value sent at login will differ and the relying party will reject the
+// assertion as an unknown credential.
+//
+// Real authenticators emit fixed-width ids (commonly 32 bytes), so a chosen id is
+// padded out to TARGET_ID_BYTES rather than left at whatever length the text
+// happened to decode to. Padding is applied in the string domain with '_' so the
+// requested text stays readable at the front of the wire form, then the value is
+// canonicalized: base64url carries 6 bits per character, so the final character
+// of a non-multiple-of-4 string has spare low bits which must be zero.
+function normalizeChosenId(text, targetBytes) {
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) {
+    throw new Error(`--credential-id must contain only base64url characters (A-Z a-z 0-9 - _); got "${text}"`);
+  }
+  // Characters needed to carry targetBytes: ceil(bytes * 8 / 6).
+  const targetChars = Math.ceil((targetBytes * 8) / 6);
+  if (text.length > targetChars) {
+    throw new Error(`--credential-id "${text}" is ${text.length} characters, too long for ${targetBytes} bytes (max ${targetChars})`);
+  }
+  const padded = text + '_'.repeat(targetChars - text.length);
+  // Re-encoding zeroes the final character's spare bits, giving the canonical
+  // form the relying party will echo back at login.
+  const canonical = Buffer.from(padded, 'base64url').toString('base64url');
+  const bytes = Buffer.from(canonical, 'base64url');
+  if (bytes.length !== targetBytes) {
+    throw new Error(`internal: expected ${targetBytes} bytes, got ${bytes.length} from "${canonical}"`);
+  }
+  if (Buffer.from(canonical, 'base64url').toString('base64url') !== canonical) {
+    throw new Error(`internal: "${canonical}" is not stable under base64url round trip`);
+  }
+  if (!canonical.startsWith(text)) {
+    throw new Error(`internal: canonical id "${canonical}" no longer starts with "${text}"`);
+  }
+  return { bytes, text: canonical, padChars: targetChars - text.length };
 }
 
 const b64url = (v) => Buffer.from(v).toString('base64url');
@@ -159,6 +203,11 @@ function pageShim() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  // Validate the chosen id before touching files or the browser: it is pure
+  // string work, and a typo should fail immediately rather than behind a
+  // missing-key error.
+  const chosen = CREDENTIAL_ID_ARG ? normalizeChosenId(CREDENTIAL_ID_ARG, TARGET_ID_BYTES) : null;
+
   const privatePem = await fs.readFile(path.join(KEY_DIR, 'private.pem'), 'utf8');
   const publicPem = await fs.readFile(path.join(KEY_DIR, 'public.pem'), 'utf8');
 
@@ -182,14 +231,21 @@ async function main() {
 
   const x = Buffer.from(jwk.x, 'base64url');
   const y = Buffer.from(jwk.y, 'base64url');
-  const credentialId = crypto.randomBytes(32);
+  const credentialId = chosen ? chosen.bytes : crypto.randomBytes(32);
   const credentialIdText = credentialId.toString('base64url');
+  if (chosen) {
+    console.log(`[id] requested : ${CREDENTIAL_ID_ARG}`);
+    console.log(`[id] wire form  : ${credentialIdText}`);
+    console.log(`[id] ${credentialId.length} bytes (${chosen.padChars} padding chars added)`);
+  }
 
   const browser = await puppeteer.connect({ browserURL: ENDPOINT });
   const manifest = {
     startedAt: new Date().toISOString(),
     keyDirectory: path.resolve(KEY_DIR),
     credentialId: credentialIdText,
+    credentialIdChosen: Boolean(CREDENTIAL_ID_ARG),
+    credentialIdRequested: CREDENTIAL_ID_ARG ?? null,
     label: LABEL,
     rpId: RP_ID,
     algorithm: -7,
@@ -210,6 +266,18 @@ async function main() {
     }
     manifest.pageUrl = page.url();
 
+    // Record only url/status/short body for registration traffic, so a failure is
+    // diagnosable. Headers are deliberately excluded: they carry session cookies.
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (!/webauthn|tfa|register|credential/i.test(url)) return;
+      const entry = { url, status: response.status() };
+      try {
+        entry.body = (await response.text()).slice(0, 400);
+      } catch { /* body unavailable */ }
+      (manifest.responses ??= []).push(entry);
+    });
+
     await page.exposeFunction('__registerCreate', async ({ rpId, challenge, origin, algorithms }) => {
       // Refuse rather than silently register a credential the RP will reject.
       if (algorithms?.length && !algorithms.includes(-7)) {
@@ -217,7 +285,8 @@ async function main() {
       }
       const json = clientDataJSON('webauthn.create', challenge, origin);
       const authData = authenticatorData({ rpId, credentialId, x, y });
-      manifest.createRequest = { rpId, origin, algorithms };
+      manifest.createRequest = { rpId, origin, algorithms, credentialIdBytes: credentialId.length };
+      console.log(`[shim] signing create for rpId=${rpId} origin=${origin} (offered algs ${algorithms?.join(', ')})`);
       return {
         type: 'public-key',
         id: credentialIdText,
@@ -232,12 +301,17 @@ async function main() {
     const source = `(${pageShim.toString()})();`;
     const client = await page.createCDPSession();
     await client.send('Page.addScriptToEvaluateOnNewDocument', { source });
+    // Reload so the shim is present on a fresh document before npm's app code
+    // runs. Installing only on the live document can leave a React bundle holding
+    // the original navigator.credentials reference it captured at load.
+    await page.reload({ waitUntil: 'networkidle2', timeout: STEP_TIMEOUT_MS * 2 });
     await page.evaluate(source);
     if (!(await page.evaluate(() => window.__registerShim === true))) {
       throw new Error('Shim failed to install');
     }
     console.log(`[shim] installed on ${page.url()}`);
 
+    const findNickname = () => page.$('input[name="nickname"], input[name="name"]');
     const clickAdd = () => page.evaluate(() => {
       const button = [...document.querySelectorAll('button, a')].find((el) =>
         /add security key|add passkey|register/i.test(el.textContent?.trim() ?? ''));
@@ -246,23 +320,30 @@ async function main() {
       return true;
     });
 
-    if (!(await clickAdd())) throw new Error('Could not find an "Add security key" control on the page');
-    console.log('[page] clicked add-security-key');
+    // npm shows the name field either immediately or after a first click,
+    // depending on how the page was reached. Handle both orders.
+    let nameInput = await findNickname();
+    if (!nameInput) {
+      if (!(await clickAdd())) throw new Error('Could not find an "Add security key" control on the page');
+      console.log('[page] clicked add-security-key to open the form');
+      const deadline = Date.now() + STEP_TIMEOUT_MS;
+      while (Date.now() < deadline && !nameInput) {
+        nameInput = await findNickname();
+        if (!nameInput) await sleep(250);
+      }
+    }
 
-    // npm asks for a nickname after the authenticator responds.
-    const deadline = Date.now() + STEP_TIMEOUT_MS;
-    let nameInput = null;
-    while (Date.now() < deadline && !nameInput) {
-      nameInput = await page.$('input[name="nickname"], input[name="name"]');
-      if (!nameInput) await sleep(250);
-    }
     if (nameInput) {
+      await nameInput.click({ clickCount: 3 }).catch(() => {});
       await nameInput.type(LABEL);
-      await clickAdd();
-      console.log(`[page] submitted label "${LABEL}"`);
+      console.log(`[page] entered label "${LABEL}"`);
     } else {
-      console.log('[page] no nickname field appeared; assuming this RP does not ask for one');
+      console.log('[page] no name field appeared; this relying party may not ask for one');
     }
+
+    // This click is what triggers navigator.credentials.create, i.e. the shim.
+    if (!(await clickAdd())) throw new Error('Could not find the submit control');
+    console.log('[page] submitted; waiting for the relying party');
 
     await sleep(3000);
     const final = await page.evaluate(() => ({

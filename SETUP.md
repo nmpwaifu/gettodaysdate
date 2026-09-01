@@ -154,6 +154,8 @@ Options:
 | --- | --- | --- |
 | `--key-dir` | *(required)* | Directory holding `private.pem` and `public.pem` |
 | `--label` | `Local P-256 key` | Name shown in the account's key list |
+| `--credential-id` | *(random)* | Choose the credential ID text instead of using 32 random bytes |
+| `--credential-id-bytes` | `32` | Byte length the chosen ID is padded out to |
 | `--endpoint` | `http://127.0.0.1:9222` | CDP endpoint from Step 2 |
 | `--rp` | `www.npmjs.com` | Relying party ID |
 | `--page-match` | `manageTfa` | Substring identifying the open tab |
@@ -162,18 +164,57 @@ Before touching the browser the script checks that `private.pem` is an EC P-256
 key and that the two PEMs are a real pair, so a mismatch fails immediately
 instead of producing a credential that can never authenticate.
 
+### Choosing your own credential ID
+
+By default the ID is 32 random bytes, which is what a hardware authenticator
+would produce and what you should normally use. If you want a recognisable ID,
+pass `--credential-id`:
+
+```bash
+node register-credential.mjs \
+  --key-dir="$HOME/webauthn-keys/npm-p256" \
+  --label="CI publishing key" \
+  --credential-id=my-ci-key
+```
+
+A credential ID is *bytes*; base64url is only how those bytes are written down.
+So the text you pass is treated as base64url and must contain only `A-Z a-z 0-9
+- _`. It is then padded with `_` and canonicalized to exactly
+`--credential-id-bytes` bytes, which is why the reported ID is longer than what
+you typed and ends in a character you did not choose:
+
+```
+[id] requested : my-ci-key
+[id] wire form  : my-ci-key_________________________________8
+[id] 32 bytes (34 padding chars added)
+```
+
+Record the **wire form**, not what you typed — that is the value the relying
+party stores and the value your automation must send back.
+
+Two caveats. Because `_` is the padding character, IDs differing only in
+trailing underscores collide (`my-key` and `my-key_` produce the same wire
+form). And the ID appears in `allowCredentials` on the login page, so anyone can
+see which credential guards the account; that is normal for WebAuthn, but do not
+put anything meaningful in it.
+
 Expected output:
 
 ```
 [shim] installed on https://www.npmjs.com/settings/you/tfa/manageTfa?action=register-key
-[page] clicked add-security-key
-[page] submitted label "CI publishing key"
+[page] entered label "CI publishing key"
+[page] submitted; waiting for the relying party
+[shim] signing create for rpId=www.npmjs.com origin=https://www.npmjs.com (offered algs -7, -257)
 
 --- result ---
 credential id : k7Qm2Xb9TfLpR4wNvZs8YcHj1AeUoD6i_gBxKtEnMqY
 manifest      : /home/you/webauthn-keys/npm-p256/credential-manifest.json
 final url     : https://www.npmjs.com/settings/you/tfa/list
 ```
+
+The `[shim] signing create` line only prints from inside the shim, so its
+presence is your proof that *your* key answered the request rather than the
+browser's own authenticator.
 
 ---
 
