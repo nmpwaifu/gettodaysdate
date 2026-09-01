@@ -1,5 +1,10 @@
 # gettodaysdate
 
+[![npm version](https://img.shields.io/npm/v/gettodaysdate)](https://www.npmjs.com/package/gettodaysdate)
+[![npm downloads](https://img.shields.io/npm/dm/gettodaysdate)](https://www.npmjs.com/package/gettodaysdate)
+[![license](https://img.shields.io/npm/l/gettodaysdate)](./LICENSE)
+[![published by puppeteer + a custom passkey](https://github.com/nmpwaifu/gettodaysdate/actions/workflows/publish.yml/badge.svg)](https://github.com/nmpwaifu/gettodaysdate/actions/workflows/publish.yml)
+
 Returns a fixed ISO date.
 
 ```js
@@ -20,7 +25,7 @@ Well, I will use my own passkeys, via keys I generate with OpenSSL! And guess wh
 
 ## How?
 
-Review the [SETUP.MD](./SETUP.md) doc on how to register a custom passkey via a shim, and the [release](./.relase/) folder for how the publishing works via puppeteer + custom passkets
+Review the [SETUP.md](./SETUP.md) doc on how to register a custom passkey via a shim, and the [release](./.release/) folder for how the publishing works via puppeteer + custom passkeys
 
 ## AI Use
 
