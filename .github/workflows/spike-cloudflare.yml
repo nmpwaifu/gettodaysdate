@@ -29,11 +29,11 @@ jobs:
         with:
           node-version: '22'
 
-      # Runners ship Chrome, but pin an explicit install so the binary path and
-      # version are deterministic rather than dependent on image contents.
+      # Pinned to a commit SHA for consistency with the publish workflow, though
+      # this job holds no secrets.
       - name: Install Chrome
         id: chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3
         with:
           chrome-version: stable
 

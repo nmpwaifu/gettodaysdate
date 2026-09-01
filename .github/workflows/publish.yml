@@ -72,11 +72,12 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      # Pin an explicit Chrome so the binary path and version are deterministic
-      # rather than dependent on runner image contents.
+      # Pinned to a commit SHA, not a tag. This job holds the npm password and
+      # the P-256 signing key, so a repointed mutable tag on a third-party
+      # action would run attacker code with access to both. Update deliberately.
       - name: Install Chrome
         id: chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3
         with:
           chrome-version: stable
 
