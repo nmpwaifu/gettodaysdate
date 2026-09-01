@@ -6,14 +6,27 @@ name: Publish to npm
 # P-256 key supplied as a secret.
 #
 # Security posture:
-#   - workflow_dispatch only. Never pull_request: this repo is public, and a fork
-#     PR able to reach these secrets would hand over the npm account.
-#   - Bound to the `Publish` environment, which requires a reviewer, so secrets
-#     are only exposed after human approval.
+#   - Never pull_request: this repo is public, and a fork PR able to reach these
+#     secrets would hand over the npm account.
+#   - Bound to the `Publish` environment. NOTE: if that environment requires a
+#     reviewer, scheduled runs pause for approval instead of publishing
+#     unattended. See the scheduling notes below.
 #   - The private key is written to a mode-600 file under a temp dir and removed
 #     in an always() step.
+#
+# Scheduling notes:
+#   - The cron fires at 00:04 UTC daily and always uses a patch bump with the
+#     runner's current date. GitHub queues cron on a best-effort basis, so the
+#     actual start can drift by minutes under load.
+#   - Cron only ever runs the workflow file from the default branch.
+#   - GitHub disables scheduled workflows after 60 days without repo activity.
+#     The daily release commit counts as activity, so this stays alive while it
+#     keeps succeeding.
 
 on:
+  schedule:
+    # 00:04 UTC daily.
+    - cron: '4 0 * * *'
   workflow_dispatch:
     inputs:
       date:
@@ -116,14 +129,28 @@ jobs:
           NPM_USERNAME: ${{ vars.NPM_USERNAME }}
           NPM_PASSWORD: ${{ secrets.NPM_PASSWORD }}
           NPM_CREDENTIAL_ID: ${{ vars.NPM_CREDENTIAL_ID }}
+          # Inputs are empty on a schedule trigger, so default them here.
+          # Passed through env rather than interpolated into the script body: a
+          # value containing shell metacharacters would otherwise be executed.
+          IN_DATE: ${{ inputs.date }}
+          IN_RELEASE: ${{ inputs.release || 'patch' }}
+          IN_DRY_RUN: ${{ inputs.dry_run || false }}
         working-directory: .release
         run: |
           set -euo pipefail
           ARGS=()
-          if [ -n "${{ inputs.date }}" ]; then ARGS+=("--date=${{ inputs.date }}"); fi
-          ARGS+=("--release=${{ inputs.release }}")
-          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=("--dry-run"); fi
-          echo "release args: ${ARGS[*]}"
+          if [ -n "${IN_DATE}" ]; then
+            case "${IN_DATE}" in
+              [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ARGS+=("--date=${IN_DATE}") ;;
+              *) echo "::error::date must be YYYY-MM-DD, got '${IN_DATE}'"; exit 1 ;;
+            esac
+          fi
+          case "${IN_RELEASE}" in
+            patch|minor|major) ARGS+=("--release=${IN_RELEASE}") ;;
+            *) echo "::error::release must be patch, minor or major, got '${IN_RELEASE}'"; exit 1 ;;
+          esac
+          if [ "${IN_DRY_RUN}" = "true" ]; then ARGS+=("--dry-run"); fi
+          echo "trigger: ${{ github.event_name }} | release args: ${ARGS[*]}"
           node release.mjs "${ARGS[@]}"
 
       - name: Remove signing key
@@ -180,6 +207,10 @@ jobs:
 
       - name: Commit version bump
         if: success() && inputs.dry_run != true
+        env:
+          # Scheduled runs have no ref name conflict, but be explicit so the
+          # push target is unambiguous for both triggers.
+          TARGET_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if git diff --quiet -- index.js test.js README.md package.json; then
@@ -192,5 +223,5 @@ jobs:
           git add index.js test.js README.md package.json
           git commit -m "Release v${VERSION} [skip ci]"
           git tag "v${VERSION}"
-          git push origin HEAD:"${GITHUB_REF_NAME}"
+          git push origin HEAD:"${TARGET_BRANCH}"
           git push origin "v${VERSION}"
