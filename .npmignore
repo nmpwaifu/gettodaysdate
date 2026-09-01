@@ -1,0 +1,11 @@
+# Keep local credentials, browser state, and WebAuthn diagnostics out of npm.
+*.pem
+*.key
+*.tgz
+.webauthn-state.json
+chromium-*
+*-profile
+scratchpad/
+*-capture.json
+*manifest.json
+node_modules/

@@ -1,0 +1,25 @@
+{
+  "name": "gettodaysdate",
+  "version": "1.0.6",
+  "description": "Return a fixed ISO date.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "date",
+    "iso-date"
+  ],
+  "license": "WTFPL",
+  "engines": {
+    "node": ">=18"
+  }
+}
