@@ -1,0 +1,180 @@
+name: Publish to npm
+
+# Publishes gettodaysdate using the headless Puppeteer + WebAuthn shim flow
+# (deliberately not OIDC/trusted publishing). npm's CLI web login is driven in a
+# headless Chromium where a page-level shim signs the WebAuthn challenge with a
+# P-256 key supplied as a secret.
+#
+# Security posture:
+#   - workflow_dispatch only. Never pull_request: this repo is public, and a fork
+#     PR able to reach these secrets would hand over the npm account.
+#   - Bound to the `Publish` environment, which requires a reviewer, so secrets
+#     are only exposed after human approval.
+#   - The private key is written to a mode-600 file under a temp dir and removed
+#     in an always() step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'ISO date to hardcode (YYYY-MM-DD). Blank = runner today.'
+        required: false
+        type: string
+      release:
+        description: 'Version bump'
+        required: false
+        default: 'patch'
+        type: choice
+        options: [patch, minor, major]
+      dry_run:
+        description: 'Prepare and test only; do not publish'
+        required: false
+        default: false
+        type: boolean
+
+# Needed to push the version bump back to the branch.
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize publishes: two concurrent runs would race on the version number
+  # and on npm's server-side WebAuthn signature counter.
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: Publish
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use a PAT-free checkout; the default token can push to this repo.
+          persist-credentials: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Pin an explicit Chrome so the binary path and version are deterministic
+      # rather than dependent on runner image contents.
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Verify runner prerequisites
+        run: |
+          set -euo pipefail
+          "${{ steps.chrome.outputs.chrome-path }}" --version
+          # The publish step needs a real PTY (npm demands EOTP otherwise) plus a
+          # FIFO for stdin, so fail fast and clearly if either is missing.
+          command -v script
+          command -v mkfifo
+
+      - name: Install release tooling
+        working-directory: .release
+        run: npm ci
+
+      - name: Stage signing key
+        id: key
+        env:
+          NPM_P256_PRIVATE_KEY: ${{ secrets.NPM_P256_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_P256_PRIVATE_KEY}" ]; then
+            echo "::error::NPM_P256_PRIVATE_KEY is not set in the Publish environment"
+            exit 1
+          fi
+          KEY_DIR="$(mktemp -d)"
+          chmod 700 "${KEY_DIR}"
+          # Quoted expansion preserves the PEM's newlines.
+          printf '%s\n' "${NPM_P256_PRIVATE_KEY}" > "${KEY_DIR}/private.pem"
+          chmod 600 "${KEY_DIR}/private.pem"
+          # Confirm it parses as an EC key without printing any key material.
+          node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const key = crypto.createPrivateKey(fs.readFileSync(process.argv[1], "utf8"));
+            if (key.asymmetricKeyType !== "ec") {
+              console.error(`::error::expected an ec key, got ${key.asymmetricKeyType}`);
+              process.exit(1);
+            }
+            console.log("signing key parsed: ec");
+          ' "${KEY_DIR}/private.pem"
+          echo "dir=${KEY_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        env:
+          CHROMIUM_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          NPM_KEY_DIR: ${{ steps.key.outputs.dir }}
+          NPM_RUN_DIR: ${{ runner.temp }}/release-run
+          NPM_USERNAME: ${{ vars.NPM_USERNAME }}
+          NPM_PASSWORD: ${{ secrets.NPM_PASSWORD }}
+          NPM_CREDENTIAL_ID: ${{ vars.NPM_CREDENTIAL_ID }}
+        working-directory: .release
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${{ inputs.date }}" ]; then ARGS+=("--date=${{ inputs.date }}"); fi
+          ARGS+=("--release=${{ inputs.release }}")
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=("--dry-run"); fi
+          echo "release args: ${ARGS[*]}"
+          node release.mjs "${ARGS[@]}"
+
+      - name: Remove signing key
+        if: always()
+        run: rm -rf "${{ steps.key.outputs.dir }}"
+
+      # Auth URLs and cookies can appear in the PTY log and auth trace. Redact
+      # before upload: this repo is public and artifacts are downloadable.
+      - name: Collect diagnostics
+        if: always()
+        env:
+          NPM_PASSWORD: ${{ secrets.NPM_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SRC="${{ runner.temp }}/release-run"
+          OUT="${{ runner.temp }}/diagnostics"
+          mkdir -p "${OUT}"
+          if [ -d "${SRC}" ]; then
+            for f in "${SRC}"/*; do
+              [ -f "${f}" ] || continue
+              case "${f}" in *.fifo) continue;; esac
+              sed -e 's#/auth/cli/[A-Za-z0-9-]*#/auth/cli/REDACTED#g' \
+                  -e 's#/login/cli/[A-Za-z0-9-]*#/login/cli/REDACTED#g' \
+                  -e "s#${NPM_PASSWORD//#/\\#}#REDACTED#g" \
+                  "${f}" > "${OUT}/$(basename "${f}")" || true
+            done
+          fi
+          ls -la "${OUT}" || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-diagnostics
+          path: ${{ runner.temp }}/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit version bump
+        if: success() && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- index.js test.js README.md package.json; then
+            echo "no source changes to commit"
+            exit 0
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add index.js test.js README.md package.json
+          git commit -m "Release v${VERSION} [skip ci]"
+          git tag "v${VERSION}"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+          git push origin "v${VERSION}"

@@ -19,6 +19,14 @@
     "iso-date"
   ],
   "license": "WTFPL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nmpwaifu/gettodaysdate.git"
+  },
+  "homepage": "https://github.com/nmpwaifu/gettodaysdate#readme",
+  "bugs": {
+    "url": "https://github.com/nmpwaifu/gettodaysdate/issues"
+  },
   "engines": {
     "node": ">=18"
   }
