@@ -59,7 +59,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     environment: Publish
-    timeout-minutes: 20
+    # The deliberate settle pauses between browser steps, plus up to 3 login
+    # attempts and 2 publish attempts, make a slow-but-successful run legitimately
+    # long. Keep headroom so a retry is never cut off mid-publish.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -162,6 +165,10 @@ jobs:
       # before upload: this repo is public and artifacts are downloadable.
       # Both plain and URL-encoded forms occur (the escalation page carries the
       # session as ?next=%2Fauth%2Fcli%2F<uuid>), so cover both.
+      #
+      # Screenshots are copied verbatim: sed would corrupt binary PNGs. They are
+      # page-content only (headless has no URL bar), and npm masks the password
+      # field, so they carry no session id or secret.
       - name: Collect diagnostics
         if: always()
         env:
@@ -174,7 +181,10 @@ jobs:
           if [ -d "${SRC}" ]; then
             for f in "${SRC}"/*; do
               [ -f "${f}" ] || continue
-              case "${f}" in *.fifo) continue;; esac
+              case "${f}" in
+                *.fifo) continue;;
+                *.png) cp "${f}" "${OUT}/$(basename "${f}")"; continue;;
+              esac
               sed -e 's#/auth/cli/[A-Za-z0-9-]*#/auth/cli/REDACTED#g' \
                   -e 's#/login/cli/[A-Za-z0-9-]*#/login/cli/REDACTED#g' \
                   -e 's#%2[Ff]auth%2[Ff]cli%2[Ff][A-Za-z0-9-]*#%2Fauth%2Fcli%2FREDACTED#g' \
@@ -185,8 +195,10 @@ jobs:
           fi
           # Fail the step if any unredacted session id survived, rather than
           # publishing an artifact that leaks one. The REDACTED placeholder also
-          # matches the id pattern, so exclude it from the scan.
-          if grep -rniE '(/|%2[Ff])(auth|login)(/|%2[Ff])cli(/|%2[Ff])[A-Za-z0-9-]{8,}' "${OUT}" 2>/dev/null | grep -v 'REDACTED' | head -5 > /tmp/leaks; then
+          # matches the id pattern, so exclude it from the scan. -a forces binary
+          # files (the screenshots) to be scanned as text too: skipping them would
+          # leave an unchecked upload path, since PNGs are copied without sed.
+          if grep -rnaE '(/|%2[Ff])(auth|login)(/|%2[Ff])cli(/|%2[Ff])[A-Za-z0-9-]{8,}' "${OUT}" 2>/dev/null | grep -av 'REDACTED' | head -5 > /tmp/leaks; then
             if [ -s /tmp/leaks ]; then
               echo "::error::unredacted CLI session id found in diagnostics; not uploading"
               cat /tmp/leaks
@@ -195,6 +207,10 @@ jobs:
             fi
           fi
           rm -f /tmp/leaks
+          echo "### Diagnostics collected" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -la "${OUT}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
           ls -la "${OUT}" || true
 
       - name: Upload diagnostics

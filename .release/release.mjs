@@ -48,6 +48,16 @@ const RUN_DIR = process.env.NPM_RUN_DIR ?? path.join(ROOT, 'run');
 const EXPECTED_FILES = ['LICENSE', 'README.md', 'index.js', 'package.json'];
 const STEP_TIMEOUT_MS = 15000;
 const AUTH_ATTEMPTS = 3;
+// npm's auth pages are React apps that fetch their escalation context after
+// first paint. Clicking the instant a control appears raced that: the Sept 2
+// failure signed an assertion and was then bounced to the homepage. Pause
+// between browser steps so the page is actually ready, with jitter so we are not
+// in lockstep with any rate limiter.
+const SETTLE_MIN_MS = 3000;
+const SETTLE_MAX_MS = 5000;
+// Generous, because the settle pauses above are deliberate spend.
+const PAGE_DEADLINE_MS = STEP_TIMEOUT_MS * 8;
+const PUBLISH_2FA_ATTEMPTS = 2;
 const PUBLISH_OK = /\+\s*\S+@\d+\.\d+\.\d+/;
 
 const args = process.argv.slice(2);
@@ -69,8 +79,81 @@ const KEEP_PROFILE = flag('keep-profile');
 if (!/^\d{4}-\d{2}-\d{2}$/.test(DATE)) throw new Error(`--date must be YYYY-MM-DD, got "${DATE}"`);
 if (!/^(patch|minor|major|\d+\.\d+\.\d+)$/.test(RELEASE)) throw new Error(`--release must be patch|minor|major|X.Y.Z, got "${RELEASE}"`);
 
-const log = (step, detail) => console.log(`[${step}] ${detail}`);
+// --------------------------------------------------------------- observability
+
+// Everything here exists because CI failures are only debuggable after the fact:
+// the browser is gone, the runner is gone, and a one-line error message is not
+// enough to tell "npm rejected us" from "the page never rendered".
+const RUN_STARTED = Date.now();
+const runEvents = [];
+const authCalls = [];
+let shotSeq = 0;
+
+const log = (step, detail) => {
+  runEvents.push({ at: new Date().toISOString(), ms: Date.now() - RUN_STARTED, step, detail });
+  console.log(`[${step}] ${detail}`);
+};
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Deliberate pause between browser interactions. Reported so the logs explain
+// where wall-clock time went.
+async function settle(why) {
+  const ms = SETTLE_MIN_MS + Math.floor(Math.random() * (SETTLE_MAX_MS - SETTLE_MIN_MS + 1));
+  log('settle', `${(ms / 1000).toFixed(1)}s — ${why}`);
+  await sleep(ms);
+}
+
+// Screenshots are the only way to see what the headless browser actually showed.
+// Failures are silent otherwise: a redirect to the homepage and a rejected
+// assertion look identical in the text trace.
+async function capture(page, label) {
+  shotSeq += 1;
+  const name = `${String(shotSeq).padStart(2, '0')}-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.png`;
+  try {
+    await fsPromises.mkdir(RUN_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(RUN_DIR, name) });
+    return name;
+  } catch {
+    return null;
+  }
+}
+
+async function flushDiagnostics(outcome) {
+  try {
+    await fsPromises.mkdir(RUN_DIR, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(RUN_DIR, 'auth-trace.json'),
+      `${JSON.stringify({ calls: authCalls }, null, 2)}\n`,
+    );
+    await fsPromises.writeFile(
+      path.join(RUN_DIR, 'run-summary.json'),
+      `${JSON.stringify({
+        startedAt: new Date(RUN_STARTED).toISOString(),
+        durationMs: Date.now() - RUN_STARTED,
+        outcome,
+        events: runEvents,
+      }, null, 2)}\n`,
+    );
+  } catch { /* diagnostics must never mask the real error */ }
+}
+
+// Surfaces the outcome on the workflow run page, so a failure does not require
+// downloading an artifact to understand.
+async function writeStepSummary(outcome) {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (!file) return;
+  const rows = runEvents.map((e) => `| ${(e.ms / 1000).toFixed(1)}s | ${e.step} | ${e.detail.replace(/\|/g, '\\|').slice(0, 160)} |`);
+  const body = [
+    `## Release ${outcome.ok ? 'succeeded' : 'failed'}`,
+    '',
+    outcome.ok ? '' : `**${outcome.error}**`,
+    '',
+    '| t | step | detail |',
+    '| --- | --- | --- |',
+    ...rows,
+    '',
+  ].join('\n');
+  await fsPromises.appendFile(file, body).catch(() => {});
+}
 
 // ---------------------------------------------------------------- source files
 
@@ -109,16 +192,41 @@ getTodaysDate(); // '${date}'
 WTFPL
 `;
 
+// The README is hand-maintained (badges, prose), so it is NOT regenerated from
+// the template when one already exists: only the example date is rewritten in
+// place. Regenerating would silently delete everything the template does not
+// know about. The template is a fallback for a fresh checkout.
+function updateReadme(existing, date) {
+  const pattern = /getTodaysDate\(\);\s*\/\/\s*'(\d{4}-\d{2}-\d{2})'/;
+  const match = existing.match(pattern);
+  if (!match) {
+    throw new Error("README.md has no \"getTodaysDate(); // 'YYYY-MM-DD'\" line to update; refusing to overwrite it");
+  }
+  if (match[1] === date) return { content: existing, changed: false };
+  return { content: existing.replace(pattern, `getTodaysDate(); // '${date}'`), changed: true };
+}
+
 async function writeSources(date) {
-  const files = {
+  const written = [];
+  for (const [name, content] of Object.entries({
     'index.js': indexSource(date),
     'test.js': testSource(date),
-    'README.md': readmeSource(date),
-  };
-  for (const [name, content] of Object.entries(files)) {
+  })) {
     await fsPromises.writeFile(path.join(PACKAGE_DIR, name), content);
+    written.push(name);
   }
-  return Object.keys(files);
+
+  const readmePath = path.join(PACKAGE_DIR, 'README.md');
+  const existing = await fsPromises.readFile(readmePath, 'utf8').catch(() => null);
+  if (existing === null) {
+    await fsPromises.writeFile(readmePath, readmeSource(date));
+    written.push('README.md (created from template)');
+  } else {
+    const { content, changed } = updateReadme(existing, date);
+    if (changed) await fsPromises.writeFile(readmePath, content);
+    written.push(changed ? 'README.md (date updated in place)' : 'README.md (already current)');
+  }
+  return written;
 }
 
 function nextVersion(current, release) {
@@ -140,10 +248,21 @@ async function bumpVersion(release) {
   // burning another version number.
   if (!isPublished(from)) return { from, to: from, reused: true };
 
-  const to = nextVersion(from, release);
+  // The registry is the source of truth, not package.json. A run that published
+  // but failed afterwards (before its bump commit landed) leaves the checkout
+  // behind the registry, and a plain bump would then target a version that
+  // already exists and fail with E403. Walk forward until the target is free.
+  let to = nextVersion(from, release);
+  const skipped = [];
+  for (let guard = 0; isPublished(to) && guard < 50; guard += 1) {
+    skipped.push(to);
+    to = nextVersion(to, release);
+  }
+  if (isPublished(to)) throw new Error(`Could not find an unpublished version after ${from}`);
+
   manifest.version = to;
   await fsPromises.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  return { from, to, reused: false };
+  return { from, to, reused: false, skipped };
 }
 
 function isPublished(version) {
@@ -176,36 +295,50 @@ function verifyPackList() {
 //   - /login?next=... which asks for username+password, then the security key
 //   - /auth/cli/<uuid> which (when already signed in) goes straight to the key
 // Signing in here also warms the browser profile for later publishes.
-async function driveAuthPage(authUrl, { endpoint, signer, keepOpen = false }) {
+async function driveAuthPage(authUrl, { endpoint, signer, keepOpen = false, label = 'auth' }) {
   const username = process.env.NPM_USERNAME;
   const password = process.env.NPM_PASSWORD;
   const browser = await puppeteer.connect({ browserURL: endpoint });
   let page;
   let done = false;
   const trace = [];
+  const shots = [];
+  const call = { label, authUrl: authUrl.replace(/[0-9a-f-]{36}/, '<session>'), startedAt: new Date().toISOString(), trace, shots };
+  authCalls.push(call);
   const record = (entry) => {
     const last = trace.at(-1);
     if (!last || last.url !== entry.url || last.text !== entry.text) trace.push(entry);
+  };
+  const shoot = async (why) => {
+    const name = await capture(page, `${label}-${why}`);
+    if (name) shots.push({ name, why, at: new Date().toISOString() });
   };
   const release = async () => {
     if (page && !keepOpen) await page.close().catch(() => {});
     await browser.disconnect();
   };
   const result = async (fields) => {
-    await fsPromises.mkdir(RUN_DIR, { recursive: true });
-    await fsPromises.writeFile(path.join(RUN_DIR, 'auth-trace.json'), `${JSON.stringify({ authUrl, trace }, null, 2)}\n`);
+    call.outcome = fields.ok ? 'ok' : (fields.reason ?? 'failed');
+    call.finishedAt = new Date().toISOString();
+    call.final = fields.final ?? null;
+    await flushDiagnostics({ ok: false, error: 'in progress' });
     return { ...fields, cleanup: release };
   };
   try {
     page = await browser.newPage();
+    // A realistic viewport: npm's layout is responsive and the security key
+    // button can land off-screen in a tiny default window.
+    await page.setViewport({ width: 1280, height: 900 });
     await page.goto('about:blank');
     if (!(await installShim(page, signer))) throw new Error('WebAuthn shim failed to install on about:blank');
     await page.goto(authUrl, { waitUntil: 'networkidle2', timeout: STEP_TIMEOUT_MS * 2 });
     if (!(await shimInstalled(page))) throw new Error('WebAuthn shim missing after navigation');
+    await settle('page loaded; letting npm\'s app finish hydrating');
+    await shoot('loaded');
 
     let clicked = false;
     let submittedLogin = false;
-    const deadline = Date.now() + STEP_TIMEOUT_MS * 4;
+    const deadline = Date.now() + PAGE_DEADLINE_MS;
     while (Date.now() < deadline) {
       const state = await page.evaluate(() => {
         const has = (sel) => document.querySelector(sel);
@@ -218,10 +351,17 @@ async function driveAuthPage(authUrl, { endpoint, signer, keepOpen = false }) {
         };
       });
 
-
-      record({ url: state.url, text: state.text.slice(0, 160), hasKeyButton: state.hasKeyButton, needsLogin: state.needsLogin, at: new Date().toISOString() });
+      record({
+        url: state.url,
+        text: state.text.replace(/^.*Learn how to prepare \u2192 \u00d7 /, '').slice(0, 160),
+        hasKeyButton: state.hasKeyButton,
+        needsLogin: state.needsLogin,
+        clicked,
+        at: new Date().toISOString(),
+      });
 
       if (/Authentication Successful|You can close this tab|authorized/i.test(state.text)) {
+        await shoot('authenticated');
         // Do NOT navigate or close here. npm finishes the handshake from this
         // page (it redirects to /auth/cli/<uuid>, which is what releases the
         // waiting CLI). Touching the page at this moment aborts that step.
@@ -229,37 +369,63 @@ async function driveAuthPage(authUrl, { endpoint, signer, keepOpen = false }) {
         done = true;
         return result({ ok: true, clicked, settled, final: await snapshot(page) });
       }
-      if (/Just a moment/i.test(state.text)) {
-        return result({ ok: false, reason: 'Cloudflare throttled the request', final: await snapshot(page) });
+      if (/Just a moment|Performing security verification|Verifying you are human/i.test(state.text)) {
+        // Cloudflare interstitials can clear on their own; wait rather than
+        // burning the whole attempt immediately.
+        await shoot('cloudflare');
+        log('page', 'Cloudflare interstitial; waiting for it to clear');
+        await settle('Cloudflare challenge in progress');
+        continue;
       }
       if (/Something went wrong/i.test(state.text) && clicked) {
+        await shoot('rejected');
         return result({ ok: false, reason: 'npm rejected the assertion', final: await snapshot(page) });
+      }
+      // Bounced to the homepage or dashboard after clicking: npm dropped the
+      // escalation context. Distinguishing this from a timeout matters, because
+      // the fix is a retry with a fresh session, not more waiting.
+      if (clicked && /^https:\/\/www\.npmjs\.com\/?$/.test(state.url)) {
+        await shoot('bounced-home');
+        return result({ ok: false, reason: 'npm redirected to the homepage instead of completing the handshake', final: await snapshot(page) });
       }
       if (state.needsLogin) {
         if (submittedLogin) {
+          await shoot('reprompted');
           return result({ ok: false, reason: 'npm re-prompted for credentials (wrong password or rate limited)', final: await snapshot(page) });
         }
         if (!username || !password) {
           throw new Error('Browser session is signed out; set NPM_USERNAME and NPM_PASSWORD');
         }
-        await (await page.$('input[name="username"], input[type="email"]')).type(username);
-        await (await page.$('input[name="password"], input[type="password"]')).type(password);
+        log('page', 'submitting credentials');
+        await (await page.$('input[name="username"], input[type="email"]')).type(username, { delay: 40 });
+        await settle('between username and password');
+        await (await page.$('input[name="password"], input[type="password"]')).type(password, { delay: 40 });
+        await settle('before submitting the login form');
         await page.click('button[type="submit"]');
         submittedLogin = true;
         await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: STEP_TIMEOUT_MS }).catch(() => {});
+        await settle('after login submit; waiting for the 2FA step');
+        await shoot('after-login');
         continue;
       }
       if (state.hasKeyButton && !clicked) {
+        // The click triggers navigator.credentials.get. If npm has not finished
+        // wiring up its escalation context, the assertion is signed and then
+        // discarded, which is exactly the Sept 2 failure.
+        await settle('security key button present; letting the page settle before clicking');
         clicked = await page.evaluate(() => {
           const target = [...document.querySelectorAll('button, a')].find((c) => /use security key/i.test(c.textContent?.trim() ?? ''));
           if (!target) return false;
           target.click();
           return true;
         });
+        log('page', `clicked "Use security key" (${clicked ? 'ok' : 'button vanished'})`);
+        await shoot('clicked-key');
         continue;
       }
       await sleep(500);
     }
+    await shoot('timeout');
     return result({ ok: false, reason: 'timed out waiting for npm confirmation', clicked, final: await snapshot(page) });
   } finally {
     // On success with keepOpen the caller closes via cleanup(); otherwise tidy up now.
@@ -279,7 +445,9 @@ async function snapshot(page) {
 // which is what notifies the waiting CLI. We only watch; navigating or closing
 // the tab during this window breaks the handshake.
 async function observeCliHandshake(page, record) {
-  const deadline = Date.now() + STEP_TIMEOUT_MS;
+  // Longer than the old 15s: the redirect is npm's server-side step and the
+  // publish depends on it, so waiting is strictly better than proceeding.
+  const deadline = Date.now() + STEP_TIMEOUT_MS * 3;
   while (Date.now() < deadline) {
     const url = page.url();
     if (/\/(auth|login)\/cli\//.test(url)) {
@@ -329,10 +497,14 @@ async function ensureLoggedIn({ endpoint, signer, requireBrowserSession = false 
     }
     log('auth', `login URL: ${authUrl}`);
 
-    const result = await driveAuthPage(authUrl, { endpoint, signer });
+    const result = await driveAuthPage(authUrl, { endpoint, signer, label: `login-${attempt}` });
     const exitDeadline = Date.now() + STEP_TIMEOUT_MS * 2;
     while (child.exitCode === null && child.signalCode === null && Date.now() < exitDeadline) await sleep(250);
     if (child.exitCode !== 0) child.kill('SIGTERM');
+
+    // Let the CLI finish writing ~/.npmrc before asking whoami; on a loaded
+    // runner the token write can lag the browser handshake.
+    await settle('letting the npm CLI persist its token');
 
     // A signed assertion is the only proof the browser session was escalated;
     // whoami would also pass on a pre-existing token.
@@ -346,8 +518,11 @@ async function ensureLoggedIn({ endpoint, signer, requireBrowserSession = false 
     const why = result.reason ?? (signedAssertion ? 'unknown' : 'no assertion signed (login page never reached the security key step)');
     log('auth', `attempt ${attempt} failed: ${why}`);
     if (attempt < AUTH_ATTEMPTS) {
-      log('auth', 'backing off before retry (Cloudflare challenges cold profiles)');
-      await sleep(15000);
+      // Escalating backoff: a rate limiter or a Cloudflare reputation check
+      // needs more than a fixed pause to forget about us.
+      const backoff = 15000 * attempt;
+      log('auth', `backing off ${backoff / 1000}s before retry (Cloudflare challenges cold profiles)`);
+      await sleep(backoff);
     }
   }
   throw new Error('Unable to establish an authenticated browser session after retries');
@@ -360,7 +535,7 @@ async function ensureLoggedIn({ endpoint, signer, requireBrowserSession = false 
 // `npm publish --auth-type=web` prints the CLI auth URL only on a TTY and then
 // blocks on "Press ENTER to open in the browser...". We give it a PTY via
 // script(1) and feed ENTER through a FIFO once we have captured the URL.
-async function publishWithBrowserAuth({ endpoint, signer }) {
+async function publishWithBrowserAuth({ endpoint, signer, attemptLabel = '1' }) {
   await fsPromises.mkdir(RUN_DIR, { recursive: true });
   const logPath = path.join(RUN_DIR, 'publish-tty.log');
   const fifoPath = path.join(RUN_DIR, 'publish-stdin.fifo');
@@ -406,7 +581,10 @@ async function publishWithBrowserAuth({ endpoint, signer }) {
     log('publish', `auth URL: ${authUrl}`);
 
     fs.writeSync(fifoFd, '\n'); // answer "Press ENTER to open in the browser..."
-    const auth = await driveAuthPage(authUrl, { endpoint, signer, keepOpen: true });
+    // npm needs a moment to register the session server-side before the page is
+    // driven; navigating too early can land on a session that is not ready.
+    await settle('CLI session opened; letting npm register it before driving the page');
+    const auth = await driveAuthPage(authUrl, { endpoint, signer, keepOpen: true, label: `publish-2fa-${attemptLabel}` });
     log('publish', `2FA ${auth.ok ? 'succeeded' : 'failed'} (clicked=${auth.clicked}, landed=${auth.settled ?? false}, signCount=${signer.signCounts.at(-1)})`);
     if (!auth.ok) {
       await auth.cleanup?.();
@@ -433,6 +611,34 @@ async function publishWithBrowserAuth({ endpoint, signer }) {
   }
 }
 
+// The 2FA page is the flakiest step in the pipeline (npm bounced us to the
+// homepage on Sept 2 after a perfectly good assertion), and a failure there
+// leaves nothing published, so it is safe to retry the whole publish. Guarded by
+// a registry check: if a previous attempt actually landed, stop rather than
+// retrying into an E403.
+async function publishWithRetries({ endpoint, signer, version }) {
+  let lastError;
+  for (let attempt = 1; attempt <= PUBLISH_2FA_ATTEMPTS; attempt += 1) {
+    try {
+      return await publishWithBrowserAuth({ endpoint, signer, attemptLabel: String(attempt) });
+    } catch (error) {
+      lastError = error;
+      log('publish', `attempt ${attempt} failed: ${error.message.split('\n')[0]}`);
+      if (isPublished(version)) {
+        log('publish', `${version} is on the registry despite the error; treating as published`);
+        return { published: true, usedBrowserAuth: true, tail: 'recovered: registry already serves this version' };
+      }
+      // A rejected assertion or a taken version will not fix itself.
+      if (/rejected the assertion|cannot publish over|E403|EPRIVATE/i.test(error.message)) throw error;
+      if (attempt < PUBLISH_2FA_ATTEMPTS) {
+        log('publish', 'retrying publish with a fresh CLI session');
+        await sleep(15000);
+      }
+    }
+  }
+  throw lastError;
+}
+
 // ------------------------------------------------------------------------ main
 
 async function main() {
@@ -441,8 +647,11 @@ async function main() {
   const written = await writeSources(DATE);
   log('source', `wrote ${written.join(', ')} with date ${DATE}`);
 
-  const { from, to, reused } = await bumpVersion(RELEASE);
+  const { from, to, reused, skipped } = await bumpVersion(RELEASE);
   log('version', reused ? `${to} (reused; not yet on registry)` : `${from} -> ${to}`);
+  if (skipped?.length) {
+    log('version', `skipped ${skipped.join(', ')}: already on the registry (checkout was behind)`);
+  }
 
   const test = runNpm(['test']);
   if (test.status !== 0) throw new Error(`Tests failed:\n${test.stdout}\n${test.stderr}`);
@@ -480,7 +689,7 @@ async function main() {
     const username = await ensureLoggedIn({ endpoint: chromium.endpoint, signer, requireBrowserSession: !REUSE_BROWSER });
     log('auth', `authenticated as ${username}`);
 
-    const result = await publishWithBrowserAuth({ endpoint: chromium.endpoint, signer });
+    const result = await publishWithRetries({ endpoint: chromium.endpoint, signer, version: to });
     if (!result.published) throw new Error(`Publish did not confirm.\n${result.tail}`);
     log('publish', `npm reported + ${PACKAGE_NAME}@${to}`);
 
@@ -500,17 +709,28 @@ async function main() {
     log('done', `released ${PACKAGE_NAME}@${live} returning ${DATE} (signCounts: ${signer.signCounts.join(', ')})`);
   } finally {
     if (chromium.close) {
-      await chromium.close();
-      log('browser', `ephemeral Chromium closed${KEEP_PROFILE ? ` (profile kept at ${chromium.profile})` : ''}`);
+      const { profileRemoved, warning } = await chromium.close();
+      log('browser', `ephemeral Chromium closed${profileRemoved ? '' : ` (profile retained: ${warning ?? chromium.profile})`}`);
     }
   }
 }
 
 let exitCode = 0;
+let outcome = { ok: true };
 try {
   await main();
 } catch (error) {
   exitCode = 1;
+  outcome = { ok: false, error: error.message };
+  log('error', error.message.split('\n')[0]);
   console.error(`\n[error] ${error.message}`);
+}
+// Diagnostics are written on both paths: a failed run is exactly when they are
+// needed, and the browser is already gone by the time anyone reads the log.
+await flushDiagnostics(outcome);
+await writeStepSummary(outcome);
+if (runEvents.some((e) => e.step === 'settle')) {
+  const settleMs = runEvents.filter((e) => e.step === 'settle').length;
+  log('timing', `total ${(Date.now() - RUN_STARTED) / 1000}s across ${runEvents.length} steps (${settleMs} deliberate pauses)`);
 }
 process.exit(exitCode);

@@ -119,6 +119,11 @@ export async function launchEphemeral({ headless = true, keepProfile = false, ti
   let exited = false;
   const exitPromise = new Promise((resolve) => child.once('exit', () => { exited = true; resolve(); }));
 
+  // Returns { profileRemoved, warning } instead of throwing. Chromium's helper
+  // processes can still be flushing into the profile when the main process
+  // exits, so rm can race them and report ENOTEMPTY. A leftover temp directory
+  // is not a reason to fail a release, so retry briefly and then give up
+  // quietly. (This raced roughly 1 run in 3 when it did throw.)
   const close = async () => {
     if (!exited) {
       child.kill('SIGTERM');
@@ -126,7 +131,18 @@ export async function launchEphemeral({ headless = true, keepProfile = false, ti
       await exitPromise;
       clearTimeout(timer);
     }
-    if (!keepProfile) await fsPromises.rm(profile, { recursive: true, force: true });
+    if (keepProfile) return { profileRemoved: false };
+    let lastError;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        await fsPromises.rm(profile, { recursive: true, force: true });
+        return { profileRemoved: true };
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 400));
+      }
+    }
+    return { profileRemoved: false, warning: `could not remove ${profile}: ${lastError?.code ?? lastError?.message}` };
   };
 
   if (!(await waitForCdp(endpoint, timeoutMs))) {
