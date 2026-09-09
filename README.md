@@ -10,7 +10,7 @@ Returns a fixed ISO date.
 ```js
 const { getTodaysDate } = require('gettodaysdate');
 
-getTodaysDate(); // '2026-09-08'
+getTodaysDate(); // '2026-09-09'
 ```
 
 # Why?
