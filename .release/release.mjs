@@ -59,6 +59,19 @@ const SETTLE_MAX_MS = 5000;
 const PAGE_DEADLINE_MS = STEP_TIMEOUT_MS * 8;
 const PUBLISH_2FA_ATTEMPTS = 2;
 const PUBLISH_OK = /\+\s*\S+@\d+\.\d+\.\d+/;
+// Post-publish verification must not read the registry packument: Cloudflare
+// serves `GET /<pkg>` (the packument that `npm view <pkg>@<version>` reads) with
+// `cache-control: public, max-age=300`, so a freshly published version can stay
+// invisible at an edge for up to five minutes. That is exactly what false-failed
+// every scheduled run from Sept 23 to Oct 1: `npm publish` had printed
+// "+ pkg@version", then the old 30s `npm view` poll timed out, the bump was
+// never committed, and the next run skipped a version number. The
+// version-specific manifest (`GET /<pkg>/<version>`) is `cf-cache-status:
+// DYNAMIC` (not edge-cached), so that is what isPublished() queries. Keep a
+// generous ceiling anyway, in case origin propagation itself is slow.
+const REGISTRY_VERIFY_TIMEOUT_MS = 2 * 60 * 1000;
+const REGISTRY_VERIFY_INTERVAL_MS = 3000;
+const REGISTRY_PROBE_TIMEOUT_MS = 20000;
 
 const args = process.argv.slice(2);
 const flag = (name) => args.some((a) => a === `--${name}`);
@@ -246,7 +259,7 @@ async function bumpVersion(release) {
   // Idempotency: if the local version was prepared but never landed on the
   // registry (e.g. a previous run failed at the 2FA step), reuse it instead of
   // burning another version number.
-  if (!isPublished(from)) return { from, to: from, reused: true };
+  if (!(await isPublished(from))) return { from, to: from, reused: true };
 
   // The registry is the source of truth, not package.json. A run that published
   // but failed afterwards (before its bump commit landed) leaves the checkout
@@ -254,20 +267,40 @@ async function bumpVersion(release) {
   // already exists and fail with E403. Walk forward until the target is free.
   let to = nextVersion(from, release);
   const skipped = [];
-  for (let guard = 0; isPublished(to) && guard < 50; guard += 1) {
+  let guard = 0;
+  while (guard < 50 && (await isPublished(to))) {
     skipped.push(to);
     to = nextVersion(to, release);
+    guard += 1;
   }
-  if (isPublished(to)) throw new Error(`Could not find an unpublished version after ${from}`);
+  if (await isPublished(to)) throw new Error(`Could not find an unpublished version after ${from}`);
 
   manifest.version = to;
   await fsPromises.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   return { from, to, reused: false, skipped };
 }
 
-function isPublished(version) {
-  const view = runNpm(['view', `${PACKAGE_NAME}@${version}`, 'version'], { cwd: PACKAGE_DIR });
-  return view.status === 0 && view.stdout.trim() === version;
+// Registry read-after-write, done right. The packument is edge-cached for
+// max-age=300 (see REGISTRY_VERIFY_TIMEOUT_MS); the version-specific manifest is
+// not. undici (Node's fetch) keeps no HTTP cache, and no-store asks any
+// intermediary not to serve a stored copy either.
+async function isPublished(version) {
+  try {
+    const res = await fetch(
+      `https://registry.npmjs.org/${encodeURIComponent(PACKAGE_NAME)}/${encodeURIComponent(version)}`,
+      {
+        headers: { accept: 'application/json' },
+        cache: 'no-store',
+        signal: AbortSignal.timeout(REGISTRY_PROBE_TIMEOUT_MS),
+      },
+    );
+    if (!res.ok) return false;
+    const manifest = await res.json();
+    return manifest?.version === version;
+  } catch {
+    // Network error, timeout or a JSON parse failure all mean "not confirmed".
+    return false;
+  }
 }
 
 // ------------------------------------------------------------------ npm checks
@@ -624,7 +657,7 @@ async function publishWithRetries({ endpoint, signer, version }) {
     } catch (error) {
       lastError = error;
       log('publish', `attempt ${attempt} failed: ${error.message.split('\n')[0]}`);
-      if (isPublished(version)) {
+      if (await isPublished(version)) {
         log('publish', `${version} is on the registry despite the error; treating as published`);
         return { published: true, usedBrowserAuth: true, tail: 'recovered: registry already serves this version' };
       }
@@ -693,19 +726,26 @@ async function main() {
     if (!result.published) throw new Error(`Publish did not confirm.\n${result.tail}`);
     log('publish', `npm reported + ${PACKAGE_NAME}@${to}`);
 
-    // Registry read-after-write can lag briefly.
+    // Ask the registry directly (not via the edge-cached packument; see
+    // REGISTRY_VERIFY_TIMEOUT_MS) so a slow CDN edge does not false-fail a run
+    // whose publish already succeeded (npm printed "+ pkg@version").
     let live;
-    const verifyDeadline = Date.now() + STEP_TIMEOUT_MS * 2;
+    let probes = 0;
+    const verifyStarted = Date.now();
+    const verifyDeadline = verifyStarted + REGISTRY_VERIFY_TIMEOUT_MS;
     while (Date.now() < verifyDeadline) {
-      const view = runNpm(['view', `${PACKAGE_NAME}@${to}`, 'version'], { cwd: ROOT });
-      if (view.status === 0 && view.stdout.trim() === to) {
-        live = view.stdout.trim();
+      probes += 1;
+      if (await isPublished(to)) {
+        live = to;
         break;
       }
-      await sleep(1500);
+      await sleep(REGISTRY_VERIFY_INTERVAL_MS);
     }
-    if (!live) throw new Error(`Published but registry has not served ${PACKAGE_NAME}@${to} yet`);
-    log('verify', `registry serves ${PACKAGE_NAME}@${live}`);
+    const verifyMs = Date.now() - verifyStarted;
+    if (!live) {
+      throw new Error(`Published but registry has not served ${PACKAGE_NAME}@${to} after ${(verifyMs / 1000).toFixed(0)}s (${probes} probes)`);
+    }
+    log('verify', `registry serves ${PACKAGE_NAME}@${live} (after ${(verifyMs / 1000).toFixed(1)}s, ${probes} probe(s))`);
     log('done', `released ${PACKAGE_NAME}@${live} returning ${DATE} (signCounts: ${signer.signCounts.join(', ')})`);
   } finally {
     if (chromium.close) {
