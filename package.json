@@ -1,6 +1,6 @@
 {
   "name": "gettodaysdate",
-  "version": "1.0.41",
+  "version": "1.0.42",
   "description": "Return a fixed ISO date.",
   "main": "index.js",
   "exports": {
