@@ -1,7 +1,7 @@
 'use strict';
 
 function getTodaysDate() {
-  return '2026-11-13';
+  return '2026-11-14';
 }
 
 module.exports = { getTodaysDate };
